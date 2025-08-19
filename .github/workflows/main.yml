@@ -1,0 +1,113 @@
+name: Recon Sweep
+
+on:
+  workflow_dispatch: {}        # manual button
+  schedule:
+    - cron: "0 6 * * 1-5"      # weekdays 06:00 UTC (optional—delete if you don't want schedule)
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Python & deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3 python3-pip
+          pip3 install --upgrade pip
+          pip3 install requests pyyaml
+
+      - name: Add swap (2G)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 2G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Install tools (prebuilt binaries)
+        env: { ARCH: ${{ runner.arch }} }
+        run: |
+          set -e
+          PAT="linux_amd64"; [ "${ARCH}" = "ARM64" ] && PAT="linux_arm64"
+          install_pd () { tmp="$(mktemp -d)"; pushd "$tmp" >/dev/null
+            url="$(curl -s https://api.github.com/repos/projectdiscovery/$1/releases/latest \
+               | grep -Eo 'browser_download_url":\s*"[^"]*'"$PAT"'[^"]*\.zip"' \
+               | cut -d\" -f4 | head -n1)"
+            wget -q "$url" -O r.zip
+            unzip -q r.zip
+            sudo install -m0755 "$1" "/usr/local/bin/$1"
+            popd >/dev/null; rm -rf "$tmp"
+          }
+          sudo apt-get install -y curl unzip ca-certificates >/dev/null 2>&1 || true
+          install_pd subfinder
+          install_pd httpx
+          install_pd nuclei
+          install_pd katana
+          # Amass
+          tmp="$(mktemp -d)"; pushd "$tmp" >/dev/null
+          AMURL="https://github.com/owasp-amass/amass/releases/latest/download/amass_${PAT}.zip"
+          wget -q "$AMURL" -O amass.zip && unzip -q amass.zip
+          sudo install -m0755 amass /usr/local/bin/amass
+          popd >/dev/null; rm -rf "$tmp"
+          # Findomain
+          tmp="$(mktemp -d)"; pushd "$tmp" >/dev/null
+          FURL="$(curl -s https://api.github.com/repos/findomain/findomain/releases/latest \
+            | grep -Eo 'browser_download_url":\s*"[^"]*linux[^"]*(zip|tar\.gz)\"' | cut -d\" -f4 | head -n1)"
+          if echo "$FURL" | grep -q '\.zip$'; then wget -q "$FURL" -O f.zip && unzip -q f.zip && sudo install -m0755 findomain* /usr/local/bin/findomain;
+          else wget -q "$FURL" -O findomain && sudo install -m0755 findomain /usr/local/bin/findomain; fi
+          popd >/dev/null; rm -rf "$tmp"
+
+      - name: Small tools (assetfinder/waybackurls/gf)
+        run: |
+          sudo apt-get install -y golang >/dev/null 2>&1 || true
+          export GOTOOLCHAIN=local
+          go install github.com/tomnomnom/assetfinder@latest >/dev/null 2>&1 || true
+          go install github.com/tomnomnom/waybackurls@latest >/dev/null 2>&1 || true
+          go install github.com/tomnomnom/gf@latest >/dev/null 2>&1 || true
+          sudo ln -sf "$HOME/go/bin/assetfinder" /usr/local/bin/assetfinder || true
+          sudo ln -sf "$HOME/go/bin/waybackurls" /usr/local/bin/waybackurls || true
+          sudo ln -sf "$HOME/go/bin/gf" /usr/local/bin/gf || true
+          nuclei -update-templates >/dev/null 2>&1 || true
+
+      - name: Optional Discord
+        if: ${{ secrets.DISCORD_WEBHOOK != '' }}
+        env: { DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }} }
+        run: |
+          python3 - <<'PY'
+import yaml, os, pathlib
+p=pathlib.Path('config.yaml'); cfg=yaml.safe_load(p.read_text()) if p.exists() else {}
+cfg['discord_webhook']=os.environ['DISCORD_WEBHOOK']
+cfg['notify']={'on_new_targets':True,'on_findings':True}
+cfg.setdefault('nuclei', {'enable': True, 'templates': '~/.local/share/nuclei-templates'})
+p.write_text(yaml.safe_dump(cfg, sort_keys=False))
+print("[i] webhook saved")
+PY
+
+      - name: Run FULL recon (no modes)
+        run: |
+          set -e
+          # If you want lighter runs, change --mode full to --mode short or --mode quick
+          python3 priority_scopes.py \
+            --mode full --min-score 10 --top 30 \
+            --run --outdir recon_out \
+            --global-merge --global-nuclei --global-nuclei-shards 4 \
+            --global-crawl --global-gf
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-${{ github.run_id }}
+          path: |
+            targets.txt
+            recon_out/**/*
+          if-no-files-found: warn
+          retention-days: 7
