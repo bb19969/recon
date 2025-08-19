@@ -10,6 +10,7 @@ jobs:
   recon:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -52,11 +53,15 @@ jobs:
           install_pd httpx
           install_pd nuclei
           install_pd katana
+
+          # Amass
           tmp="$(mktemp -d)"; cd "$tmp"
-          wget -q "https://github.com/owasp-amass/amass/releases/latest/download/amass_${PAT}.zip" -o /dev/null -O amass.zip
+          wget -q "https://github.com/owasp-amass/amass/releases/latest/download/amass_${PAT}.zip" -O amass.zip
           unzip -q amass.zip
           sudo install -m0755 amass /usr/local/bin/amass
           cd - >/dev/null; rm -rf "$tmp"
+
+          # Findomain
           tmp="$(mktemp -d)"; cd "$tmp"
           FURL="$(curl -s https://api.github.com/repos/findomain/findomain/releases/latest \
             | grep -Eo 'browser_download_url":\s*"[^"]*linux[^"]*(zip|tar\.gz)\"' | cut -d\" -f4 | head -n1)"
@@ -70,7 +75,7 @@ jobs:
           fi
           cd - >/dev/null; rm -rf "$tmp"
 
-      - name: Small tools (assetfinder/waybackurls/gf)
+      - name: Install small tools (assetfinder/waybackurls/gf)
         run: |
           sudo apt-get install -y golang >/dev/null 2>&1 || true
           export GOTOOLCHAIN=local
@@ -82,14 +87,36 @@ jobs:
           sudo ln -sf "$HOME/go/bin/gf" /usr/local/bin/gf || true
           nuclei -update-templates >/dev/null 2>&1 || true
 
-      - name: Run recon (full chain)
+      # ---------- important: ensure we have targets ----------
+      - name: Seed targets.txt if missing
         run: |
-          set -e
+          if [ ! -s targets.txt ]; then
+            echo "[i] targets.txt missing or empty — seeding with example.com"
+            echo "example.com" > targets.txt
+          fi
+          echo "[i] targets.txt contents:"
+          cat targets.txt | sed -n '1,10p'
+
+      - name: Run recon (full chain, never fail job)
+        run: |
+          set -o pipefail
+          mkdir -p recon_out
+          # Lower bar so we actually get some targets for demo runs
           python3 priority_scopes.py \
-            --mode full --min-score 10 --top 30 \
+            --mode full --min-score 0 --top 15 \
             --run --outdir recon_out \
-            --global-merge --global-nuclei --global-nuclei-shards 4 \
-            --global-crawl --global-gf
+            --global-merge --global-nuclei --global-nuclei-shards 2 \
+            --global-crawl --global-gf || EXIT=$?
+          echo "[i] priority_scopes exit code: ${EXIT:-0}"
+          # Never fail the job here; artifact upload step will still run
+          exit 0
+
+      - name: List outputs (debug)
+        run: |
+          echo "[i] targets.txt:"
+          sed -n '1,50p' targets.txt || true
+          echo "[i] tree recon_out:"
+          find recon_out -type f -maxdepth 3 2>/dev/null | sed -n '1,100p' || true
 
       - name: Upload artifacts
         if: always()
